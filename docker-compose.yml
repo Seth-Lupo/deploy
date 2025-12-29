@@ -1,0 +1,48 @@
+# Voice Pipeline - Docker Compose
+#
+# Usage:
+#   docker-compose up -d
+#   docker-compose logs -f
+#   docker-compose down
+#
+# Requires nvidia-docker2 for GPU support
+
+version: '3.8'
+
+services:
+  voice-pipeline:
+    build: .
+    image: voice-pipeline:latest
+    container_name: voice-pipeline
+    ports:
+      - "8765:8765"
+    volumes:
+      # Cache models between restarts
+      - huggingface-cache:/root/.cache/huggingface
+      - torch-cache:/root/.cache/torch
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0
+      # Model configuration
+      - ASR_MODEL=large-v3
+      - LLM_MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ
+      - LLM_QUANTIZATION=awq
+      - TTS_VOICE=tara
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  huggingface-cache:
+  torch-cache:

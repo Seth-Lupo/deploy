@@ -1,0 +1,14 @@
+# Voice Pipeline Client Requirements
+# Install on your local machine to connect to the server
+#
+# pip install -r requirements-client.txt
+
+# WebSocket client
+websockets>=13.0
+
+# Audio I/O (cross-platform)
+sounddevice>=0.5.0
+numpy>=1.24.0
+
+# Optional: for audio file support
+soundfile>=0.12.0
