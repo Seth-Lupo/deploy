@@ -271,27 +271,38 @@ class QwenTRTLLM:
                         if hasattr(outputs[0][0], '__len__'):
                             logger.info(f"outputs[0][0] len: {len(outputs[0][0])}")
 
-                # TRT-LLM returns output_ids directly (includes input + generated)
-                # For ModelRunnerCpp, outputs is a list of tensors
-                if hasattr(outputs[0], 'tolist'):
+                # TRT-LLM returns outputs with shape [batch, seq_len] or [batch, beams, seq_len]
+                # outputs[0] is first batch, outputs[0][0] is the token sequence
+                if len(outputs[0].shape) == 2:
+                    # Shape is [batch, seq_len], get first batch
+                    output_ids = outputs[0][0].tolist()
+                elif len(outputs[0].shape) == 1:
+                    # Shape is [seq_len]
                     output_ids = outputs[0].tolist()
-                elif isinstance(outputs[0], list) and len(outputs[0]) > 0:
-                    if hasattr(outputs[0][0], 'tolist'):
-                        output_ids = outputs[0][0].tolist()
-                    else:
-                        output_ids = outputs[0]
                 else:
-                    output_ids = list(outputs[0]) if hasattr(outputs[0], '__iter__') else [outputs[0]]
+                    # Fallback
+                    output_ids = outputs[0].flatten().tolist()
 
                 logger.info(f"LLM output_ids type: {type(output_ids)}, len: {len(output_ids) if hasattr(output_ids, '__len__') else 'N/A'}")
                 logger.info(f"Input length: {len(input_ids_list)}")
 
-                # Decode only new tokens
-                new_tokens = output_ids[len(input_ids_list):]
+                # Strip padding tokens (usually 0 or pad_token_id)
+                pad_id = self._tokenizer.pad_token_id or 0
+                eos_id = self._tokenizer.eos_token_id
+
+                # Find where actual generation ends (EOS or padding)
+                gen_end = len(output_ids)
+                for i, tok in enumerate(output_ids[len(input_ids_list):], start=len(input_ids_list)):
+                    if tok == eos_id or tok == pad_id:
+                        gen_end = i
+                        break
+
+                # Decode only new tokens (excluding padding)
+                new_tokens = output_ids[len(input_ids_list):gen_end]
                 logger.info(f"New tokens: {len(new_tokens)} - {new_tokens[:20] if len(new_tokens) > 0 else 'empty'}")
 
                 full_text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
-                logger.info(f"Decoded text: '{full_text[:100] if full_text else 'empty'}'")
+                logger.info(f"Decoded text: '{full_text[:200] if full_text else 'empty'}'")
 
                 # Simulate streaming by yielding words
                 words = full_text.split(' ')
