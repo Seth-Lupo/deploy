@@ -151,6 +151,7 @@ class ChatterboxHybridTTS:
             return
 
         import torch
+        import torch.nn as nn
 
         # Load TRT GPT2 transformer
         trt_path = os.path.join(self.config.model_path, "gpt2_transformer.trt")
@@ -161,27 +162,115 @@ class ChatterboxHybridTTS:
             logger.error(f"GPT2 TRT engine not found: {trt_path}")
             raise FileNotFoundError(f"Missing TRT engine: {trt_path}")
 
-        # Load Chatterbox PyTorch model for embeddings/heads/S3Gen
-        logger.info("Loading Chatterbox PyTorch components...")
-        try:
-            from chatterbox.tts_turbo import ChatterboxTurboTTS
+        # Load T3 components from safetensors/weights
+        logger.info("Loading T3 embeddings and heads...")
+        self._load_t3_components()
 
-            full_model = ChatterboxTurboTTS.from_pretrained(device=self.config.device)
-            self._t3 = full_model.t3
-            self._s3gen = full_model.s3gen
+        # Load S3Gen vocoder
+        logger.info("Loading S3Gen vocoder...")
+        self._load_s3gen()
 
-            # Set to eval mode
-            self._t3.eval()
-            self._s3gen.eval()
-
-            logger.info("Chatterbox PyTorch components loaded")
-        except Exception as e:
-            logger.error(f"Failed to load Chatterbox: {e}")
-            raise
+        # Load text tokenizer
+        logger.info("Loading tokenizer...")
+        from transformers import AutoTokenizer
+        self._tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
         # Warmup
         self._warmup()
         logger.info("Chatterbox Hybrid TTS ready")
+
+    def _load_t3_components(self):
+        """Load T3 embedding layers and output heads from weights"""
+        import torch
+        import torch.nn as nn
+
+        device = self.config.device
+
+        # T3 config from the model
+        vocab_size_text = 50276  # GPT2 vocab
+        vocab_size_speech = 6563  # Speech tokens (6561 + start + stop)
+        hidden_size = 1024
+
+        # Create embedding layers
+        self._text_emb = nn.Embedding(vocab_size_text, hidden_size).to(device)
+        self._speech_emb = nn.Embedding(vocab_size_speech, hidden_size).to(device)
+        self._speech_head = nn.Linear(hidden_size, vocab_size_speech, bias=False).to(device)
+
+        # Try to load weights from various sources
+        weight_files = [
+            os.path.join(self.config.model_path, "t3_components.pt"),
+            os.path.join(self.config.model_path, "t3.safetensors"),
+            os.path.join(self.config.model_path, "model.safetensors"),
+        ]
+
+        weights_loaded = False
+        for wf in weight_files:
+            if os.path.exists(wf):
+                try:
+                    if wf.endswith('.safetensors'):
+                        from safetensors.torch import load_file
+                        state_dict = load_file(wf)
+                    else:
+                        state_dict = torch.load(wf, map_location=device, weights_only=True)
+
+                    # Map weights - handle different naming conventions
+                    if 'text_emb.weight' in state_dict:
+                        self._text_emb.weight.data = state_dict['text_emb.weight']
+                    if 'speech_emb.weight' in state_dict:
+                        self._speech_emb.weight.data = state_dict['speech_emb.weight']
+                    if 'speech_head.weight' in state_dict:
+                        self._speech_head.weight.data = state_dict['speech_head.weight']
+
+                    weights_loaded = True
+                    logger.info(f"Loaded T3 weights from: {wf}")
+                    break
+                except Exception as e:
+                    logger.warning(f"Failed to load {wf}: {e}")
+
+        if not weights_loaded:
+            # Initialize with random weights - will need proper weights for good output
+            logger.warning("No T3 weights found, using random initialization (quality will be poor)")
+            nn.init.normal_(self._text_emb.weight, std=0.02)
+            nn.init.normal_(self._speech_emb.weight, std=0.02)
+            nn.init.normal_(self._speech_head.weight, std=0.02)
+
+        self._text_emb.eval()
+        self._speech_emb.eval()
+        self._speech_head.eval()
+
+    def _load_s3gen(self):
+        """Load S3Gen vocoder"""
+        import torch
+
+        # Try standalone S3Gen first
+        try:
+            from s3gen import S3Token2Wav
+
+            weight_files = [
+                os.path.join(self.config.model_path, "s3gen.safetensors"),
+                os.path.join(self.config.model_path, "s3gen_meanflow.safetensors"),
+                os.path.join(self.config.model_path, "s3gen.pt"),
+            ]
+
+            for wf in weight_files:
+                if os.path.exists(wf):
+                    self._s3gen = S3Token2Wav()
+                    if wf.endswith('.safetensors'):
+                        from safetensors.torch import load_file
+                        state_dict = load_file(wf)
+                    else:
+                        state_dict = torch.load(wf, map_location=self.config.device, weights_only=False)
+                    self._s3gen.load_state_dict(state_dict, strict=False)
+                    self._s3gen.to(self.config.device).eval()
+                    logger.info(f"Loaded S3Gen from: {wf}")
+                    return
+        except ImportError:
+            logger.warning("s3gen module not found")
+        except Exception as e:
+            logger.warning(f"Failed to load S3Gen: {e}")
+
+        logger.error("S3Gen vocoder not loaded - TTS will not produce audio")
+        self._s3gen = None
 
     def _warmup(self):
         """Warmup TRT engine"""
@@ -243,27 +332,10 @@ class ChatterboxHybridTTS:
 
         device = self.config.device
 
-        # Get T3 components
-        text_emb = self._t3.text_emb
-        speech_emb = self._t3.speech_emb
-        speech_head = self._t3.speech_head
-
-        # Tokenize text using T3's method
-        # T3 uses its own text tokenization
+        # Tokenize text using GPT2 tokenizer
         with torch.no_grad():
-            # Prepare text input - T3 expects specific format
-            # Use the model's prepare method if available
-            if hasattr(self._t3, 'prepare_input_embeds'):
-                # Get text embeddings through T3
-                text_tokens = self._t3.hp.text_tokenizer.encode(text)
-                text_tokens = torch.tensor([text_tokens], device=device, dtype=torch.long)
-                text_embeds = text_emb(text_tokens)
-            else:
-                # Fallback: use GPT2 tokenizer
-                from transformers import AutoTokenizer
-                tokenizer = AutoTokenizer.from_pretrained("gpt2")
-                text_tokens = tokenizer.encode(text, return_tensors="pt").to(device)
-                text_embeds = text_emb(text_tokens)
+            text_tokens = self._tokenizer.encode(text, return_tensors="pt").to(device)
+            text_embeds = self._text_emb(text_tokens)
 
         # Speech token constants
         start_speech_token = 6561
@@ -277,7 +349,7 @@ class ChatterboxHybridTTS:
         # Get initial speech embedding
         with torch.no_grad():
             speech_input = torch.tensor([[start_speech_token]], device=device, dtype=torch.long)
-            speech_embeds = speech_emb(speech_input)
+            speech_embeds = self._speech_emb(speech_input)
 
             # Combine embeddings
             combined_embeds = torch.cat([text_embeds, speech_embeds], dim=1)
@@ -293,7 +365,7 @@ class ChatterboxHybridTTS:
         # Get logits from last hidden state using PyTorch head
         with torch.no_grad():
             hidden_torch = torch.from_numpy(hidden_np[:, -1:, :]).to(device)
-            logits = speech_head(hidden_torch)
+            logits = self._speech_head(hidden_torch)
             logits = logits.squeeze().cpu().numpy()
 
         # Sample first token
@@ -320,7 +392,7 @@ class ChatterboxHybridTTS:
             # Get embedding for current token
             with torch.no_grad():
                 current_input = torch.tensor([[next_token]], device=device, dtype=torch.long)
-                current_embed = speech_emb(current_input)
+                current_embed = self._speech_emb(current_input)
                 current_np = current_embed.cpu().numpy()
 
             # Update attention mask for KV cache
@@ -333,7 +405,7 @@ class ChatterboxHybridTTS:
             # Get logits
             with torch.no_grad():
                 hidden_torch = torch.from_numpy(hidden_np[:, -1:, :]).to(device)
-                logits = speech_head(hidden_torch)
+                logits = self._speech_head(hidden_torch)
                 logits = logits.squeeze().cpu().numpy()
 
             # Sample next token
