@@ -166,6 +166,7 @@ class QwenTRTLLM:
     def _warmup(self):
         """Warmup the engine with a simple generation"""
         try:
+            import torch
             messages = [{"role": "user", "content": "Hi"}]
             text = self._tokenizer.apply_chat_template(
                 messages,
@@ -175,12 +176,12 @@ class QwenTRTLLM:
             )
             input_ids = self._tokenizer(text, return_tensors="pt").input_ids
 
-            # Convert to list properly
-            input_ids_list = input_ids[0].tolist() if hasattr(input_ids[0], 'tolist') else list(input_ids[0])
+            # TRT-LLM expects list of tensors
+            batch_input_ids = [input_ids[0].to(torch.int32)]
 
             # Run warmup generation
             outputs = self._runner.generate(
-                batch_input_ids=[input_ids_list],
+                batch_input_ids=batch_input_ids,
                 max_new_tokens=10,
                 end_id=self._tokenizer.eos_token_id,
                 pad_id=self._tokenizer.pad_token_id or self._tokenizer.eos_token_id,
@@ -243,8 +244,12 @@ class QwenTRTLLM:
 
             else:
                 # Non-streaming fallback - generate all at once then simulate streaming
+                # TRT-LLM expects list of tensors, not list of lists
+                import torch
+                batch_input_ids = [torch.tensor(input_ids_list, dtype=torch.int32)]
+
                 outputs = self._runner.generate(
-                    batch_input_ids=[input_ids_list],
+                    batch_input_ids=batch_input_ids,
                     max_new_tokens=self.config.max_new_tokens,
                     end_id=self._tokenizer.eos_token_id,
                     pad_id=self._tokenizer.pad_token_id or self._tokenizer.eos_token_id,
