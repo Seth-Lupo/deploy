@@ -259,41 +259,23 @@ class ChatterboxHybridTTS:
         self._speech_head.eval()
 
     def _load_s3gen(self):
-        """Load S3Gen vocoder"""
+        """Load S3Gen vocoder from Chatterbox"""
         import torch
-        import sys
 
-        # Add deploy directory to path for s3gen import
-        deploy_dir = os.path.dirname(os.path.abspath(__file__))
-        if deploy_dir not in sys.path:
-            sys.path.insert(0, deploy_dir)
-
-        # Try standalone S3Gen first
+        # Load S3Gen from Chatterbox package (it has the correct architecture)
         try:
-            from s3gen import S3Token2Wav
+            from chatterbox.tts_turbo import ChatterboxTurboTTS
 
-            weight_files = [
-                os.path.join(self.config.model_path, "s3gen.safetensors"),
-                os.path.join(self.config.model_path, "s3gen_meanflow.safetensors"),
-                os.path.join(self.config.model_path, "s3gen.pt"),
-            ]
-
-            for wf in weight_files:
-                if os.path.exists(wf):
-                    self._s3gen = S3Token2Wav()
-                    if wf.endswith('.safetensors'):
-                        from safetensors.torch import load_file
-                        state_dict = load_file(wf)
-                    else:
-                        state_dict = torch.load(wf, map_location=self.config.device, weights_only=False)
-                    self._s3gen.load_state_dict(state_dict, strict=False)
-                    self._s3gen.to(self.config.device).eval()
-                    logger.info(f"Loaded S3Gen from: {wf}")
-                    return
+            logger.info("Loading S3Gen from Chatterbox...")
+            full_model = ChatterboxTurboTTS.from_pretrained(device=self.config.device)
+            self._s3gen = full_model.s3gen
+            self._s3gen.eval()
+            logger.info("Loaded S3Gen from Chatterbox")
+            return
         except ImportError:
-            logger.warning("s3gen module not found")
+            logger.warning("chatterbox package not found")
         except Exception as e:
-            logger.warning(f"Failed to load S3Gen: {e}")
+            logger.warning(f"Failed to load Chatterbox S3Gen: {e}")
 
         logger.error("S3Gen vocoder not loaded - TTS will not produce audio")
         self._s3gen = None
