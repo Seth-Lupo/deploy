@@ -122,6 +122,7 @@ class ChatterboxTRTTTS:
         # Find S3Gen weights file
         s3gen_weights = None
         weight_files = [
+            "s3gen_meanflow.safetensors",
             "s3gen.safetensors",
             "s3gen.pt",
             "s3gen.pth",
