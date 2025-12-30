@@ -25,6 +25,7 @@ class TTSConfig:
     sample_rate: int = 24000
     voice_reference: Optional[str] = None
     # Generation settings
+    exaggeration: float = 0.0
     temperature: float = 0.8
     top_k: int = 50
     top_p: float = 0.95
