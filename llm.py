@@ -264,9 +264,15 @@ class QwenTRTLLM:
                 if hasattr(output_ids, 'tolist'):
                     output_ids = output_ids.tolist()
 
+                logger.info(f"LLM output_ids type: {type(output_ids)}, len: {len(output_ids) if hasattr(output_ids, '__len__') else 'N/A'}")
+                logger.info(f"Input length: {len(input_ids_list)}")
+
                 # Decode only new tokens
                 new_tokens = output_ids[len(input_ids_list):]
+                logger.info(f"New tokens: {len(new_tokens)} - {new_tokens[:20] if len(new_tokens) > 0 else 'empty'}")
+
                 full_text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
+                logger.info(f"Decoded text: '{full_text[:100] if full_text else 'empty'}'")
 
                 # Simulate streaming by yielding words
                 words = full_text.split(' ')
