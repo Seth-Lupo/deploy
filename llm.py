@@ -259,10 +259,29 @@ class QwenTRTLLM:
                     repetition_penalty=self.config.repetition_penalty,
                 )
 
-                # Get output tokens
-                output_ids = outputs[0][0] if isinstance(outputs[0], list) else outputs[0]
-                if hasattr(output_ids, 'tolist'):
-                    output_ids = output_ids.tolist()
+                # Debug raw output structure
+                logger.info(f"Raw outputs type: {type(outputs)}")
+                logger.info(f"Raw outputs[0] type: {type(outputs[0])}")
+                if hasattr(outputs[0], 'shape'):
+                    logger.info(f"outputs[0] shape: {outputs[0].shape}")
+                if hasattr(outputs[0], '__len__'):
+                    logger.info(f"outputs[0] len: {len(outputs[0])}")
+                    if len(outputs[0]) > 0:
+                        logger.info(f"outputs[0][0] type: {type(outputs[0][0])}")
+                        if hasattr(outputs[0][0], '__len__'):
+                            logger.info(f"outputs[0][0] len: {len(outputs[0][0])}")
+
+                # TRT-LLM returns output_ids directly (includes input + generated)
+                # For ModelRunnerCpp, outputs is a list of tensors
+                if hasattr(outputs[0], 'tolist'):
+                    output_ids = outputs[0].tolist()
+                elif isinstance(outputs[0], list) and len(outputs[0]) > 0:
+                    if hasattr(outputs[0][0], 'tolist'):
+                        output_ids = outputs[0][0].tolist()
+                    else:
+                        output_ids = outputs[0]
+                else:
+                    output_ids = list(outputs[0]) if hasattr(outputs[0], '__iter__') else [outputs[0]]
 
                 logger.info(f"LLM output_ids type: {type(output_ids)}, len: {len(output_ids) if hasattr(output_ids, '__len__') else 'N/A'}")
                 logger.info(f"Input length: {len(input_ids_list)}")
