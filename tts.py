@@ -493,16 +493,14 @@ class ChatterboxHybridTTS:
         tokens_tensor = torch.from_numpy(valid_tokens).long().to(self.config.device)
 
         with torch.no_grad():
-            # S3Gen inference
-            ref_wav = self._conds.get('ref_wav') if self._conds else None
-            ref_sr = self._conds.get('ref_sr') if self._conds else None
+            # S3Gen inference - use .inference() method
+            ref_dict = self._conds if self._conds else None
 
-            wav = self._s3gen(
-                speech_tokens=tokens_tensor.unsqueeze(0),
-                ref_wav=ref_wav.unsqueeze(0) if ref_wav is not None else None,
-                ref_sr=ref_sr,
-                finalize=True,
+            wav, _ = self._s3gen.inference(
+                speech_tokens=tokens_tensor,
+                ref_dict=ref_dict,
                 n_cfm_timesteps=2,  # Turbo mode
+                finalize=True,
             )
 
             wav = wav.squeeze().cpu().numpy()
