@@ -11,14 +11,33 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 # TensorRT imports - available in TRT container
+import threading
+
 try:
     import tensorrt as trt
     import pycuda.driver as cuda
-    import pycuda.autoinit
+    # Initialize CUDA driver
+    cuda.init()
     TRT_AVAILABLE = True
+    # Thread-local storage for CUDA contexts
+    _thread_local = threading.local()
+    _primary_context = None
 except ImportError:
     TRT_AVAILABLE = False
     logger.warning("TensorRT not available - running in CPU fallback mode")
+
+
+def ensure_cuda_context():
+    """Ensure CUDA context is initialized for the current thread"""
+    global _primary_context
+
+    if not hasattr(_thread_local, 'cuda_context_initialized'):
+        device = cuda.Device(0)
+        # Use retain_primary_context for thread-safe sharing
+        if _primary_context is None:
+            _primary_context = device.retain_primary_context()
+        _primary_context.push()
+        _thread_local.cuda_context_initialized = True
 
 
 @dataclass
@@ -53,6 +72,7 @@ class TRTEngine:
 
     def load(self):
         """Load TensorRT engine from file"""
+        ensure_cuda_context()
         logger.info(f"Loading TensorRT engine: {self.engine_path}")
 
         trt_logger = trt.Logger(trt.Logger.WARNING)
@@ -135,6 +155,8 @@ class TRTEngine:
         Returns:
             Dictionary mapping output names to numpy arrays
         """
+        ensure_cuda_context()
+
         # Get input shapes
         input_shapes = {name: arr.shape for name, arr in inputs.items()}
 
@@ -174,6 +196,7 @@ class TRTEngine:
 
     def warmup(self, input_shapes: Optional[Dict[str, Tuple[int, ...]]] = None):
         """Warmup the engine with dummy inputs"""
+        ensure_cuda_context()
         if input_shapes is None:
             # Use default shapes from bindings
             input_shapes = {}
