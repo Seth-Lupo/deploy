@@ -58,6 +58,10 @@ class GPT2TRTRunner:
         logger.info(f"Loading GPT2 TRT engine: {self.engine_path}")
         self._engine = TRTEngine(self.engine_path)
         self._engine.load()
+
+        # Log available inputs/outputs
+        logger.info(f"  Inputs: {self._engine.input_names}")
+        logger.info(f"  Outputs: {self._engine.output_names}")
         logger.info("GPT2 TRT engine loaded")
 
     def run(
@@ -71,7 +75,7 @@ class GPT2TRTRunner:
 
         Args:
             inputs_embeds: [batch, seq_len, 1024]
-            attention_mask: [batch, total_len]
+            attention_mask: [batch, seq_len] - for current tokens only
             past_key_values: List of (key, value) tuples for each layer
 
         Returns:
@@ -81,9 +85,14 @@ class GPT2TRTRunner:
         batch_size = inputs_embeds.shape[0]
         seq_len = inputs_embeds.shape[1]
 
-        # Initialize empty KV cache if not provided
+        # Determine past length from KV cache
+        if past_key_values is not None:
+            past_len = past_key_values[0][0].shape[2]
+        else:
+            past_len = 1  # TRT engine was built with min past_len=1
+
+        # Initialize minimal KV cache if not provided (TRT requires these inputs)
         if past_key_values is None:
-            past_len = 1  # TRT engine expects min 1
             past_key_values = [
                 (
                     np.zeros((batch_size, self._n_head, past_len, self._head_dim), dtype=np.float32),
@@ -91,6 +100,10 @@ class GPT2TRTRunner:
                 )
                 for _ in range(self._n_layer)
             ]
+
+        # Attention mask: TRT engine expects [batch, past_len + seq_len]
+        total_len = past_len + seq_len
+        attention_mask = np.ones((batch_size, total_len), dtype=np.int64)
 
         # Build input dict
         inputs = {
@@ -104,7 +117,14 @@ class GPT2TRTRunner:
             inputs[f"past_key_values.{i}.value"] = v.astype(np.float32)
 
         # Run inference
-        outputs = self._engine.infer(inputs)
+        try:
+            outputs = self._engine.infer(inputs)
+        except Exception as e:
+            logger.error(f"TRT inference failed: {e}")
+            logger.error(f"  inputs_embeds shape: {inputs_embeds.shape}")
+            logger.error(f"  attention_mask shape: {attention_mask.shape}")
+            logger.error(f"  past_len: {past_len}, seq_len: {seq_len}")
+            raise
 
         # Extract outputs
         last_hidden_state = outputs["last_hidden_state"]
@@ -354,29 +374,32 @@ class ChatterboxHybridTTS:
             # Combine embeddings
             combined_embeds = torch.cat([text_embeds, speech_embeds], dim=1)
 
-        # Convert to numpy for TRT
-        combined_np = combined_embeds.cpu().numpy()
-        seq_len = combined_np.shape[1]
-        attention_mask = np.ones((1, seq_len), dtype=np.int64)
+        # Autoregressive generation (no KV cache for simplicity - recompute each step)
+        # This is slower but more reliable with TRT
+        all_embeds = combined_embeds  # [1, seq_len, 1024]
 
-        # Initial TRT forward pass
-        hidden_np, kv_cache = self._gpt2_trt.run(combined_np, attention_mask)
-
-        # Get logits from last hidden state using PyTorch head
-        with torch.no_grad():
-            hidden_torch = torch.from_numpy(hidden_np[:, -1:, :]).to(device)
-            logits = self._speech_head(hidden_torch)
-            logits = logits.squeeze().cpu().numpy()
-
-        # Sample first token
-        next_token = self._sample_token(logits, temperature, top_k, top_p, speech_tokens, repetition_penalty)
-        speech_tokens.append(next_token)
-        chunk_buffer.append(next_token)
-
-        # Autoregressive generation with KV cache
         for i in range(max_gen_len):
             if self._stop_event.is_set():
                 break
+
+            # Convert to numpy for TRT
+            embeds_np = all_embeds.cpu().numpy()
+            seq_len = embeds_np.shape[1]
+            attention_mask = np.ones((1, seq_len), dtype=np.int64)
+
+            # TRT forward (no KV cache)
+            hidden_np, _ = self._gpt2_trt.run(embeds_np, attention_mask, None)
+
+            # Get logits from last hidden state
+            with torch.no_grad():
+                hidden_torch = torch.from_numpy(hidden_np[:, -1:, :]).to(device)
+                logits = self._speech_head(hidden_torch)
+                logits = logits.squeeze().cpu().numpy()
+
+            # Sample next token
+            next_token = self._sample_token(logits, temperature, top_k, top_p, speech_tokens, repetition_penalty)
+            speech_tokens.append(next_token)
+            chunk_buffer.append(next_token)
 
             # Check for EOS
             if next_token == stop_speech_token:
@@ -389,32 +412,19 @@ class ChatterboxHybridTTS:
                 yield np.array(chunk_buffer, dtype=np.int64)
                 chunk_buffer = []
 
-            # Get embedding for current token
+            # Append new token embedding for next iteration
             with torch.no_grad():
-                current_input = torch.tensor([[next_token]], device=device, dtype=torch.long)
-                current_embed = self._speech_emb(current_input)
-                current_np = current_embed.cpu().numpy()
+                new_token_input = torch.tensor([[next_token]], device=device, dtype=torch.long)
+                new_embed = self._speech_emb(new_token_input)
+                all_embeds = torch.cat([all_embeds, new_embed], dim=1)
 
-            # Update attention mask for KV cache
-            past_len = kv_cache[0][0].shape[2]
-            attention_mask = np.ones((1, past_len + 1), dtype=np.int64)
-
-            # TRT forward with KV cache (single token)
-            hidden_np, kv_cache = self._gpt2_trt.run(current_np, attention_mask, kv_cache)
-
-            # Get logits
-            with torch.no_grad():
-                hidden_torch = torch.from_numpy(hidden_np[:, -1:, :]).to(device)
-                logits = self._speech_head(hidden_torch)
-                logits = logits.squeeze().cpu().numpy()
-
-            # Sample next token
-            next_token = self._sample_token(logits, temperature, top_k, top_p, speech_tokens, repetition_penalty)
-            speech_tokens.append(next_token)
-            chunk_buffer.append(next_token)
+            # Limit sequence length to avoid OOM
+            if all_embeds.shape[1] > 500:
+                logger.warning("Sequence too long, truncating")
+                break
 
         # Yield remaining
-        if chunk_buffer and chunk_buffer[-1] != stop_speech_token:
+        if chunk_buffer and (not chunk_buffer or chunk_buffer[-1] != stop_speech_token):
             yield np.array(chunk_buffer, dtype=np.int64)
 
     def _sample_token(

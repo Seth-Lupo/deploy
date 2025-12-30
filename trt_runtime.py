@@ -128,10 +128,14 @@ class TRTEngine:
                 shape = input_shapes.get(name, binding.shape)
             else:
                 shape = self.context.get_tensor_shape(name)
-                # Convert TRT Dims to tuple if needed
-                if hasattr(shape, '__iter__') and not isinstance(shape, tuple):
+                # Convert TRT Dims to tuple - must iterate explicitly
+                if not isinstance(shape, (tuple, list)):
+                    shape = tuple(int(shape[i]) for i in range(len(shape)))
+                elif not isinstance(shape, tuple):
                     shape = tuple(shape)
 
+            # Ensure shape is a tuple of ints
+            shape = tuple(int(s) for s in shape)
             size = int(np.prod(shape) * np.dtype(binding.dtype).itemsize)
 
             # Reallocate if size changed
