@@ -30,6 +30,8 @@ class LLMConfig:
     top_k: int = 20
     repetition_penalty: float = 1.1
     do_sample: bool = True
+    # Sentence splitting - only split after this many chars (0 = never split mid-response)
+    min_chars_before_split: int = 300
     # Chat settings
     system_prompt: str = """You are a fast, helpful voice assistant. Keep responses extremely brief - one sentence when possible. Never use emojis, asterisks, or special formatting. Speak naturally and directly. Get to the point immediately."""
 
@@ -37,24 +39,30 @@ class LLMConfig:
 class SentenceBuffer:
     """
     Buffer that accumulates tokens and yields complete sentences
-    Optimized for streaming TTS input
+    Only splits on sentence boundaries after min_chars threshold
     """
 
-    def __init__(self):
+    def __init__(self, min_chars_before_split: int = 300):
         self._buffer = ""
-        # Sentence-ending patterns - split on commas too for faster TTS
-        self._end_patterns = re.compile(r'[.!?]+[\s"\')\]]*|[:;,]\s')
+        self._min_chars = min_chars_before_split
+        # Only split on actual sentence endings
+        self._end_patterns = re.compile(r'[.!?]+[\s"\')\]]*')
         # Thinking tags pattern (for Qwen3)
         self._thinking_pattern = re.compile(r'<think>.*?</think>', re.DOTALL)
 
     def add_token(self, token: str) -> Optional[str]:
         """
         Add token and return complete sentence if available
+        Only splits if buffer has accumulated >= min_chars
         """
         self._buffer += token
 
         # Remove thinking tags
         self._buffer = self._thinking_pattern.sub('', self._buffer)
+
+        # Only check for split if we have enough characters
+        if len(self._buffer) < self._min_chars:
+            return None
 
         # Check for sentence boundary
         match = self._end_patterns.search(self._buffer)
@@ -285,7 +293,7 @@ class StreamingLLM:
     def __init__(self, config: Optional[LLMConfig] = None):
         self.config = config or LLMConfig()
         self._llm = QwenLLM(self.config)
-        self._sentence_buffer = SentenceBuffer()
+        self._sentence_buffer = SentenceBuffer(self.config.min_chars_before_split)
         self._conversation: List[dict] = []
         self._on_token: Optional[Callable[[str], Any]] = None
         self._on_sentence: Optional[Callable[[str], Any]] = None
