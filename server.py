@@ -1,7 +1,7 @@
 """
-WebSocket Server - Voice Pipeline API
+WebSocket Server - Voice Pipeline API with TensorRT
 Real-time bidirectional audio streaming with text and metrics
-Optimized for A100/A10G GPUs with FP16 models
+Optimized for A100/A10G/L4 GPUs with TensorRT acceleration
 """
 
 import asyncio
@@ -29,20 +29,22 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ServerConfig:
-    """Server configuration"""
+    """Server configuration for TensorRT pipeline"""
     host: str = "0.0.0.0"
     port: int = 8765
     # Pipeline config
     system_prompt: Optional[str] = None
     voice_reference: Optional[str] = None
-    # ASR config
-    asr_model: str = "istupakov/parakeet-tdt-0.6b-v2-onnx"
-    asr_quantization: str = "fp16"
-    # LLM config
-    llm_model_id: str = "Qwen/Qwen3-4B-Instruct-2507"
-    llm_dtype: str = "float16"
+    # Model base path
+    model_base_path: str = "/workspace/models"
+    # ASR config - Parakeet TRT
+    asr_model_path: str = "/workspace/models/parakeet-tdt-0.6b-v2"
+    # LLM config - Qwen TRT-LLM
+    llm_engine_path: str = "/workspace/models/qwen3-4b-int8wo-engine"
+    llm_tokenizer_path: str = "Qwen/Qwen3-4B-Instruct-2507"
     llm_temperature: float = 0.7
-    # TTS config
+    # TTS config - Chatterbox TRT
+    tts_model_path: str = "/workspace/models/chatterbox-turbo"
     tts_exaggeration: float = 0.5
 
 
@@ -77,7 +79,7 @@ class ConnectionManager:
 class VoiceSession:
     """
     Voice session for a single WebSocket connection
-    Handles bidirectional audio streaming
+    Handles bidirectional audio streaming with TensorRT acceleration
     """
 
     def __init__(self, websocket: WebSocket, config: ServerConfig):
@@ -91,13 +93,14 @@ class VoiceSession:
 
     async def start(self):
         """Initialize and start the session"""
-        # Create pipeline config
+        # Create pipeline config with TRT paths
         pipeline_config = PipelineConfig(
-            asr_model=self.config.asr_model,
-            asr_quantization=self.config.asr_quantization,
-            llm_model_id=self.config.llm_model_id,
-            llm_dtype=self.config.llm_dtype,
+            model_base_path=self.config.model_base_path,
+            asr_model_path=self.config.asr_model_path,
+            llm_engine_path=self.config.llm_engine_path,
+            llm_tokenizer_path=self.config.llm_tokenizer_path,
             llm_temperature=self.config.llm_temperature,
+            tts_model_path=self.config.tts_model_path,
             tts_exaggeration=self.config.tts_exaggeration,
         )
 
@@ -345,15 +348,15 @@ server_config = ServerConfig()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler"""
-    logger.info("Voice pipeline server starting...")
+    logger.info("TensorRT Voice Pipeline Server starting...")
     yield
     logger.info("Voice pipeline server shutting down...")
 
 
 app = FastAPI(
-    title="Voice Pipeline Server",
-    description="Real-time voice conversation API with FP16 models",
-    version="2.0.0",
+    title="Voice Pipeline Server (TensorRT)",
+    description="Real-time voice conversation API with TensorRT acceleration",
+    version="3.0.0",
     lifespan=lifespan
 )
 
@@ -371,7 +374,7 @@ async def root():
     """Health check"""
     return {
         "status": "ok",
-        "service": "voice-pipeline",
+        "service": "voice-pipeline-trt",
         "connections": len(manager.active_connections)
     }
 
@@ -383,9 +386,9 @@ async def health():
         "status": "healthy",
         "connections": len(manager.active_connections),
         "config": {
-            "asr_model": server_config.asr_model,
-            "llm_model": server_config.llm_model_id,
-            "llm_dtype": server_config.llm_dtype,
+            "asr_model_path": server_config.asr_model_path,
+            "llm_engine_path": server_config.llm_engine_path,
+            "tts_model_path": server_config.tts_model_path,
             "has_voice_reference": server_config.voice_reference is not None,
         }
     }
@@ -421,24 +424,27 @@ def main():
     """Main entry point"""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Voice Pipeline Server (FP16)")
+    parser = argparse.ArgumentParser(description="Voice Pipeline Server (TensorRT)")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8765, help="Port to bind to")
     parser.add_argument("--system-prompt", default=None, help="System prompt")
     parser.add_argument("--voice-reference", default=None, help="Voice reference audio file")
+    # Model paths
+    parser.add_argument("--model-base-path", default="/workspace/models",
+                       help="Base path for models")
     # ASR
-    parser.add_argument("--asr-model", default="istupakov/parakeet-tdt-0.6b-v2-onnx",
-                       help="ASR model ID")
-    parser.add_argument("--asr-quantization", default="fp16",
-                       choices=["fp16", "fp32", "int8"], help="ASR quantization")
+    parser.add_argument("--asr-model-path", default="/workspace/models/parakeet-tdt-0.6b-v2",
+                       help="Path to Parakeet TRT model")
     # LLM
-    parser.add_argument("--llm-model-id", default="Qwen/Qwen3-4B-Instruct-2507",
-                       help="LLM model ID")
-    parser.add_argument("--llm-dtype", default="float16",
-                       choices=["float16", "bfloat16", "float32"], help="LLM dtype")
+    parser.add_argument("--llm-engine-path", default="/workspace/models/qwen3-4b-int8wo-engine",
+                       help="Path to TensorRT-LLM engine")
+    parser.add_argument("--llm-tokenizer-path", default="Qwen/Qwen3-4B-Instruct-2507",
+                       help="HuggingFace tokenizer path")
     parser.add_argument("--llm-temperature", type=float, default=0.7,
                        help="LLM temperature")
     # TTS
+    parser.add_argument("--tts-model-path", default="/workspace/models/chatterbox-turbo",
+                       help="Path to Chatterbox TRT model")
     parser.add_argument("--tts-exaggeration", type=float, default=0.5,
                        help="TTS emotion exaggeration")
 
@@ -450,17 +456,19 @@ def main():
         port=args.port,
         system_prompt=args.system_prompt,
         voice_reference=args.voice_reference,
-        asr_model=args.asr_model,
-        asr_quantization=args.asr_quantization,
-        llm_model_id=args.llm_model_id,
-        llm_dtype=args.llm_dtype,
+        model_base_path=args.model_base_path,
+        asr_model_path=args.asr_model_path,
+        llm_engine_path=args.llm_engine_path,
+        llm_tokenizer_path=args.llm_tokenizer_path,
         llm_temperature=args.llm_temperature,
+        tts_model_path=args.tts_model_path,
         tts_exaggeration=args.tts_exaggeration,
     )
 
-    logger.info(f"Starting server on {args.host}:{args.port}")
-    logger.info(f"ASR: {args.asr_model} ({args.asr_quantization})")
-    logger.info(f"LLM: {args.llm_model_id} ({args.llm_dtype})")
+    logger.info(f"Starting TensorRT server on {args.host}:{args.port}")
+    logger.info(f"ASR: {args.asr_model_path}")
+    logger.info(f"LLM: {args.llm_engine_path}")
+    logger.info(f"TTS: {args.tts_model_path}")
 
     uvicorn.run(
         app,
