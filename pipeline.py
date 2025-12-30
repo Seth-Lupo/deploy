@@ -1,7 +1,7 @@
 """
-Voice Pipeline - Streaming ASR → LLM → TTS
+Voice Pipeline - Streaming ASR → LLM → TTS with TensorRT
 Concurrent, efficient pipeline with proper data structures for streaming
-Optimized for A100/A10G GPUs with FP16 models
+Optimized for A100/A10G/L4 GPUs with TensorRT acceleration
 """
 
 import asyncio
@@ -30,21 +30,24 @@ class PipelineState(Enum):
 
 @dataclass
 class PipelineConfig:
-    """Configuration for the voice pipeline"""
-    # ASR settings
-    asr_model: str = "istupakov/parakeet-tdt-0.6b-v2-onnx"
-    asr_quantization: str = "fp16"
+    """Configuration for the voice pipeline - TensorRT optimized"""
+    # Model base path in container
+    model_base_path: str = "/workspace/models"
+
+    # ASR settings - Parakeet TRT
+    asr_model_path: str = "/workspace/models/parakeet-tdt-0.6b-v2"
     asr_sample_rate: int = 16000
     asr_vad_threshold: float = 0.5
     asr_silence_ms: int = 400
 
-    # LLM settings
-    llm_model_id: str = "Qwen/Qwen3-4B-Instruct-2507"
-    llm_dtype: str = "float16"
+    # LLM settings - Qwen TRT-LLM
+    llm_engine_path: str = "/workspace/models/qwen3-4b-int8wo-engine"
+    llm_tokenizer_path: str = "Qwen/Qwen3-4B-Instruct-2507"
     llm_max_tokens: int = 150
     llm_temperature: float = 0.6
 
-    # TTS settings
+    # TTS settings - Chatterbox TRT + PyTorch vocoder
+    tts_model_path: str = "/workspace/models/chatterbox-turbo"
     tts_device: str = "cuda"
     tts_voice_reference: Optional[str] = None
     tts_exaggeration: float = 0.5
@@ -121,10 +124,10 @@ class PipelineMetrics:
 
 class VoicePipeline:
     """
-    Complete voice pipeline with streaming between models
+    Complete voice pipeline with TensorRT-accelerated streaming
 
     Flow:
-    Audio In → ASR (utterance detection) → LLM (sentence streaming) → TTS (audio streaming) → Audio Out
+    Audio In → ASR (TRT) → LLM (TRT-LLM) → TTS (TRT+PyTorch) → Audio Out
 
     Uses asyncio queues and events for concurrent, efficient streaming
     """
@@ -191,13 +194,12 @@ class VoicePipeline:
         return 0.0
 
     async def initialize(self):
-        """Initialize all pipeline components"""
-        logger.info("Initializing voice pipeline...")
+        """Initialize all pipeline components with TensorRT"""
+        logger.info("Initializing TensorRT voice pipeline...")
 
-        # Initialize ASR
+        # Initialize ASR with TRT
         asr_config = ASRConfig(
-            model=self.config.asr_model,
-            quantization=self.config.asr_quantization,
+            model_path=self.config.asr_model_path,
             sample_rate=self.config.asr_sample_rate,
             vad_threshold=self.config.asr_vad_threshold,
             max_silence_ms=self.config.asr_silence_ms,
@@ -206,12 +208,12 @@ class VoicePipeline:
 
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, self._asr.load)
-        logger.info("ASR initialized")
+        logger.info("ASR (TRT) initialized")
 
-        # Initialize LLM
+        # Initialize LLM with TRT-LLM
         llm_config = LLMConfig(
-            model_id=self.config.llm_model_id,
-            dtype=self.config.llm_dtype,
+            engine_path=self.config.llm_engine_path,
+            tokenizer_path=self.config.llm_tokenizer_path,
             max_new_tokens=self.config.llm_max_tokens,
             temperature=self.config.llm_temperature,
             system_prompt=self.config.system_prompt,
@@ -224,23 +226,24 @@ class VoicePipeline:
         )
 
         await loop.run_in_executor(None, self._llm.load)
-        logger.info("LLM initialized")
+        logger.info("LLM (TRT-LLM) initialized")
 
-        # Initialize TTS
+        # Initialize TTS with TRT + PyTorch vocoder
         tts_config = TTSConfig(
+            model_path=self.config.tts_model_path,
             device=self.config.tts_device,
             voice_reference=self.config.tts_voice_reference,
             exaggeration=self.config.tts_exaggeration,
         )
         self._tts = StreamingTTS(tts_config)
         await loop.run_in_executor(None, self._tts.load)
-        logger.info("TTS initialized")
+        logger.info("TTS (TRT + PyTorch vocoder) initialized")
 
         # Start TTS worker
         self._tts_worker_task = asyncio.create_task(self._tts_worker())
 
         self._set_state(PipelineState.IDLE)
-        logger.info("Voice pipeline ready")
+        logger.info("TensorRT voice pipeline ready")
 
     def _handle_llm_token(self, token: str):
         """Handle LLM token for metrics"""
@@ -494,7 +497,7 @@ class VoicePipeline:
 
     async def shutdown(self):
         """Shutdown pipeline"""
-        logger.info("Shutting down pipeline...")
+        logger.info("Shutting down TensorRT pipeline...")
         self._shutdown_event.set()
 
         if self._tts_worker_task:

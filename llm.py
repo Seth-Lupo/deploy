@@ -1,13 +1,14 @@
 """
-LLM Module - Qwen3 4B Instruct via Transformers (FP16)
-Streaming text generation using HuggingFace transformers
-Optimized for A100/A10G GPUs
+LLM Module - Qwen3 4B Instruct with TensorRT-LLM (INT8)
+Streaming text generation using TensorRT-LLM
+Optimized for A100/A10G/L4 GPUs
 """
 
 import asyncio
 import logging
 import re
 import time
+import os
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Optional, List, Callable, Any
 from concurrent.futures import ThreadPoolExecutor
@@ -20,9 +21,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class LLMConfig:
     """Configuration for LLM module"""
-    model_id: str = "Qwen/Qwen3-4B-Instruct-2507"
+    engine_path: str = "/workspace/models/qwen3-4b-int8wo-engine"
+    tokenizer_path: str = "Qwen/Qwen3-4B-Instruct-2507"
     device: str = "cuda"
-    dtype: str = "float16"  # float16, bfloat16, or float32
     # Generation settings
     max_new_tokens: int = 150
     temperature: float = 0.6
@@ -98,60 +99,72 @@ class SentenceBuffer:
         self._buffer = ""
 
 
-class QwenLLM:
+class QwenTRTLLM:
     """
-    Qwen3 LLM using HuggingFace Transformers
-    FP16 inference optimized for A100/A10G
+    Qwen3 LLM using TensorRT-LLM
+    INT8 weight-only quantized for optimal performance
     """
 
     def __init__(self, config: Optional[LLMConfig] = None):
         self.config = config or LLMConfig()
-        self._model = None
+        self._runner = None
         self._tokenizer = None
-        self._streamer = None
         self._stop_event = Event()
         self._executor = ThreadPoolExecutor(max_workers=1)
 
     def load(self):
-        """Load model and tokenizer"""
-        if self._model is not None:
+        """Load TensorRT-LLM engine and tokenizer"""
+        if self._runner is not None:
             return
 
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        logger.info(f"Loading TensorRT-LLM engine: {self.config.engine_path}")
 
-        logger.info(f"Loading model: {self.config.model_id}")
-        logger.info(f"Device: {self.config.device}, Dtype: {self.config.dtype}")
-
-        # Determine dtype
-        dtype_map = {
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "float32": torch.float32,
-        }
-        torch_dtype = dtype_map.get(self.config.dtype, torch.float16)
-
-        # Load tokenizer
+        # Load tokenizer from HuggingFace
+        from transformers import AutoTokenizer
         self._tokenizer = AutoTokenizer.from_pretrained(
-            self.config.model_id,
+            self.config.tokenizer_path,
             trust_remote_code=True
         )
 
-        # Load model
-        self._model = AutoModelForCausalLM.from_pretrained(
-            self.config.model_id,
-            torch_dtype=torch_dtype,
-            device_map=self.config.device,
-            trust_remote_code=True,
-        )
-        self._model.eval()
+        # Load TensorRT-LLM runner
+        try:
+            from tensorrt_llm.runtime import ModelRunnerCpp
+            from tensorrt_llm.bindings import GptJsonConfig
+
+            # Load engine config
+            config_path = os.path.join(self.config.engine_path, "config.json")
+            engine_path = os.path.join(self.config.engine_path, "rank0.engine")
+
+            logger.info(f"Loading engine from: {engine_path}")
+
+            self._runner = ModelRunnerCpp.from_dir(
+                engine_dir=self.config.engine_path,
+                rank=0,
+            )
+
+            logger.info("TensorRT-LLM ModelRunnerCpp loaded")
+
+        except ImportError:
+            # Fallback to Python runner
+            logger.warning("ModelRunnerCpp not available, trying Python runner")
+            try:
+                from tensorrt_llm.runtime import ModelRunner
+
+                self._runner = ModelRunner.from_dir(
+                    engine_dir=self.config.engine_path,
+                    rank=0,
+                )
+                logger.info("TensorRT-LLM ModelRunner loaded")
+            except Exception as e:
+                logger.error(f"Failed to load TensorRT-LLM: {e}")
+                raise
 
         # Warmup
         self._warmup()
-        logger.info("Qwen LLM loaded and ready")
+        logger.info("Qwen TRT-LLM loaded and ready")
 
     def _warmup(self):
-        """Warmup the model with a simple generation"""
+        """Warmup the engine with a simple generation"""
         try:
             messages = [{"role": "user", "content": "Hi"}]
             text = self._tokenizer.apply_chat_template(
@@ -160,15 +173,19 @@ class QwenLLM:
                 add_generation_prompt=True,
                 enable_thinking=False
             )
-            inputs = self._tokenizer(text, return_tensors="pt").to(self._model.device)
-            with torch.no_grad():
-                _ = self._model.generate(
-                    **inputs,
-                    max_new_tokens=10,
-                    do_sample=False,
-                    pad_token_id=self._tokenizer.eos_token_id
-                )
-            logger.info("LLM warmup complete")
+            input_ids = self._tokenizer(text, return_tensors="pt").input_ids
+
+            # Run warmup generation
+            outputs = self._runner.generate(
+                batch_input_ids=[input_ids[0].tolist()],
+                max_new_tokens=10,
+                end_id=self._tokenizer.eos_token_id,
+                pad_id=self._tokenizer.pad_token_id or self._tokenizer.eos_token_id,
+                temperature=1.0,
+                top_p=1.0,
+                top_k=1,
+            )
+            logger.info("TRT-LLM warmup complete")
         except Exception as e:
             logger.warning(f"Warmup failed: {e}")
 
@@ -177,10 +194,7 @@ class QwenLLM:
         messages: List[dict],
         output_queue: Queue,
     ):
-        """Streaming generation in a separate thread"""
-        import torch
-        from transformers import TextIteratorStreamer
-
+        """Streaming generation using TensorRT-LLM"""
         self._stop_event.clear()
 
         try:
@@ -189,50 +203,75 @@ class QwenLLM:
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=False  # Disable thinking for voice responses
+                enable_thinking=False
             )
 
-            inputs = self._tokenizer(text, return_tensors="pt").to(self._model.device)
+            input_ids = self._tokenizer(text, return_tensors="pt").input_ids
+            input_ids_list = input_ids[0].tolist()
 
-            # Create streamer
-            streamer = TextIteratorStreamer(
-                self._tokenizer,
-                skip_prompt=True,
-                skip_special_tokens=True
-            )
+            # TensorRT-LLM streaming generation
+            # Use streaming callback if available
+            if hasattr(self._runner, 'generate_async'):
+                # Async streaming generation
+                async def stream_tokens():
+                    async for output in self._runner.generate_async(
+                        batch_input_ids=[input_ids_list],
+                        max_new_tokens=self.config.max_new_tokens,
+                        end_id=self._tokenizer.eos_token_id,
+                        pad_id=self._tokenizer.pad_token_id or self._tokenizer.eos_token_id,
+                        temperature=self.config.temperature if self.config.do_sample else 1.0,
+                        top_p=self.config.top_p if self.config.do_sample else 1.0,
+                        top_k=self.config.top_k if self.config.do_sample else 1,
+                        streaming=True,
+                    ):
+                        if self._stop_event.is_set():
+                            break
+                        # Decode new tokens
+                        new_tokens = output[0][len(input_ids_list):]
+                        text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
+                        output_queue.put(text)
 
-            # Generation kwargs
-            gen_kwargs = {
-                **inputs,
-                "streamer": streamer,
-                "max_new_tokens": self.config.max_new_tokens,
-                "temperature": self.config.temperature,
-                "top_p": self.config.top_p,
-                "top_k": self.config.top_k,
-                "repetition_penalty": self.config.repetition_penalty,
-                "do_sample": self.config.do_sample,
-                "pad_token_id": self._tokenizer.eos_token_id,
-            }
+                # Run in event loop
+                import asyncio
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(stream_tokens())
+                loop.close()
 
-            # Start generation in a thread
-            def generate():
-                with torch.no_grad():
-                    self._model.generate(**gen_kwargs)
+            else:
+                # Non-streaming fallback - generate all at once then simulate streaming
+                outputs = self._runner.generate(
+                    batch_input_ids=[input_ids_list],
+                    max_new_tokens=self.config.max_new_tokens,
+                    end_id=self._tokenizer.eos_token_id,
+                    pad_id=self._tokenizer.pad_token_id or self._tokenizer.eos_token_id,
+                    temperature=self.config.temperature if self.config.do_sample else 1.0,
+                    top_p=self.config.top_p if self.config.do_sample else 1.0,
+                    top_k=self.config.top_k if self.config.do_sample else 1,
+                    repetition_penalty=self.config.repetition_penalty,
+                )
 
-            gen_thread = Thread(target=generate)
-            gen_thread.start()
+                # Get output tokens
+                output_ids = outputs[0][0] if isinstance(outputs[0], list) else outputs[0]
+                if hasattr(output_ids, 'tolist'):
+                    output_ids = output_ids.tolist()
 
-            # Stream tokens
-            for token in streamer:
-                if self._stop_event.is_set():
-                    break
-                if token:
+                # Decode only new tokens
+                new_tokens = output_ids[len(input_ids_list):]
+                full_text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+                # Simulate streaming by yielding words
+                words = full_text.split(' ')
+                for i, word in enumerate(words):
+                    if self._stop_event.is_set():
+                        break
+                    token = word if i == 0 else ' ' + word
                     output_queue.put(token)
-
-            gen_thread.join(timeout=1.0)
 
         except Exception as e:
             logger.error(f"Generation error: {e}")
+            import traceback
+            traceback.print_exc()
 
         output_queue.put(None)  # Signal completion
 
@@ -244,7 +283,7 @@ class QwenLLM:
         Async streaming generation
         Yields tokens as they're generated
         """
-        if self._model is None:
+        if self._runner is None:
             self.load()
 
         output_queue = Queue()
@@ -287,12 +326,16 @@ class QwenLLM:
         """Cleanup resources"""
         self._stop_event.set()
         self._executor.shutdown(wait=False)
-        if self._model is not None:
-            del self._model
-            self._model = None
+        if self._runner is not None:
+            del self._runner
+            self._runner = None
         if self._tokenizer is not None:
             del self._tokenizer
             self._tokenizer = None
+
+
+# Alias for compatibility
+QwenLLM = QwenTRTLLM
 
 
 class StreamingLLM:
@@ -303,7 +346,7 @@ class StreamingLLM:
 
     def __init__(self, config: Optional[LLMConfig] = None):
         self.config = config or LLMConfig()
-        self._llm = QwenLLM(self.config)
+        self._llm = QwenTRTLLM(self.config)
         self._sentence_buffer = SentenceBuffer(self.config.min_chars_before_split)
         self._conversation: List[dict] = []
         self._on_token: Optional[Callable[[str], Any]] = None
@@ -403,7 +446,3 @@ class StreamingLLM:
     def shutdown(self):
         """Cleanup"""
         self._llm.shutdown()
-
-
-# Import for backwards compatibility
-import torch

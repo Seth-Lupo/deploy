@@ -1,13 +1,14 @@
 """
-ASR Module - Parakeet TDT 0.6B V2 (FP16/FP32)
+ASR Module - Parakeet TDT 0.6B V2 with TensorRT
 High-performance speech recognition using NVIDIA's Parakeet model
-Optimized for A100/A10G GPUs
+Optimized for A100/A10G/L4 GPUs with TensorRT acceleration
 """
 
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass
 from typing import Optional, Callable, Any
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -19,8 +20,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ASRConfig:
     """Configuration for ASR module"""
-    model: str = "istupakov/parakeet-tdt-0.6b-v2-onnx"  # Public ONNX version
-    quantization: str = "fp16"  # fp16, fp32, or int8
+    model_path: str = "/workspace/models/parakeet-tdt-0.6b-v2"
     sample_rate: int = 16000
     # VAD settings
     use_vad: bool = True
@@ -107,71 +107,188 @@ class VADProcessor:
         return min(energy / 0.1, 1.0)
 
 
-class ParakeetASR:
+class ParakeetTRTASR:
     """
-    Parakeet ASR using ONNX runtime
-    FP16/FP32 inference optimized for A100/A10G
+    Parakeet ASR using TensorRT engines
+    Uses encoder.trt and decoder_joint.trt for inference
     """
 
     def __init__(self, config: Optional[ASRConfig] = None):
         self.config = config or ASRConfig()
-        self._model = None
+        self._encoder = None
+        self._decoder = None
+        self._preprocessor = None
+        self._tokenizer = None
         self._executor = ThreadPoolExecutor(max_workers=2)
 
     def load(self):
-        """Load Parakeet model"""
-        if self._model is not None:
+        """Load TensorRT engines and preprocessor"""
+        if self._encoder is not None:
             return
 
-        import onnx_asr
+        from trt_runtime import TRTEngine
 
-        logger.info(f"Loading Parakeet ASR: {self.config.model}")
-        logger.info(f"Quantization: {self.config.quantization}")
+        encoder_path = os.path.join(self.config.model_path, "trt", "encoder.trt")
+        decoder_path = os.path.join(self.config.model_path, "trt", "decoder_joint.trt")
 
-        # Force CUDA execution provider
-        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-        logger.info(f"Using ONNX providers: {providers}")
+        logger.info(f"Loading Parakeet TRT encoder: {encoder_path}")
+        self._encoder = TRTEngine(encoder_path)
+        self._encoder.load()
 
-        # Load with specified quantization
-        # For FP16/FP32, we use the non-int8 model
-        if self.config.quantization == "int8":
-            self._model = onnx_asr.load_model(
-                self.config.model,
-                quantization="int8",
-                providers=providers
-            )
-        else:
-            # FP16/FP32 - load without quantization
-            self._model = onnx_asr.load_model(
-                self.config.model,
-                quantization=None,  # Uses default FP16/FP32
-                providers=providers
-            )
+        logger.info(f"Loading Parakeet TRT decoder: {decoder_path}")
+        self._decoder = TRTEngine(decoder_path)
+        self._decoder.load()
+
+        # Load preprocessor for mel spectrogram extraction
+        self._load_preprocessor()
+
+        # Load tokenizer/vocabulary
+        self._load_tokenizer()
 
         # Warmup
         self._warmup()
-        logger.info("Parakeet ASR loaded")
+        logger.info("Parakeet TRT ASR loaded")
+
+    def _load_preprocessor(self):
+        """Load audio preprocessor for mel spectrogram extraction"""
+        try:
+            import torch
+            import torchaudio
+
+            # Parakeet uses 80 mel bins, 10ms hop, 25ms window
+            self._mel_transform = torchaudio.transforms.MelSpectrogram(
+                sample_rate=self.config.sample_rate,
+                n_fft=512,
+                win_length=int(0.025 * self.config.sample_rate),  # 25ms
+                hop_length=int(0.01 * self.config.sample_rate),   # 10ms
+                n_mels=80,
+                f_min=0,
+                f_max=8000,
+            )
+            self._preprocessor = "torchaudio"
+            logger.info("Using torchaudio preprocessor")
+        except ImportError:
+            # Fallback to librosa
+            try:
+                import librosa
+                self._preprocessor = "librosa"
+                logger.info("Using librosa preprocessor")
+            except ImportError:
+                raise RuntimeError("Neither torchaudio nor librosa available for preprocessing")
+
+    def _load_tokenizer(self):
+        """Load vocabulary for decoding"""
+        # Parakeet TDT uses SentencePiece tokenizer
+        # Try to load from model directory
+        vocab_path = os.path.join(self.config.model_path, "tokenizer.model")
+        if os.path.exists(vocab_path):
+            try:
+                import sentencepiece as spm
+                self._tokenizer = spm.SentencePieceProcessor()
+                self._tokenizer.Load(vocab_path)
+                logger.info("Loaded SentencePiece tokenizer")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to load SentencePiece: {e}")
+
+        # Fallback: try to download from HuggingFace
+        try:
+            from transformers import AutoTokenizer
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                "nvidia/parakeet-tdt-0.6b-v2",
+                trust_remote_code=True
+            )
+            logger.info("Loaded HuggingFace tokenizer")
+        except Exception as e:
+            logger.warning(f"Failed to load HF tokenizer: {e}")
+            # Use simple character-based decoding as last resort
+            self._tokenizer = None
+
+    def _preprocess_audio(self, audio: np.ndarray) -> np.ndarray:
+        """Convert audio to mel spectrogram features"""
+        if self._preprocessor == "torchaudio":
+            import torch
+            audio_tensor = torch.from_numpy(audio).float().unsqueeze(0)
+            mel = self._mel_transform(audio_tensor)
+            # Log mel
+            mel = torch.log(mel.clamp(min=1e-10))
+            # Normalize
+            mel = (mel - mel.mean()) / (mel.std() + 1e-10)
+            return mel.numpy()
+        else:
+            # Librosa fallback
+            import librosa
+            mel = librosa.feature.melspectrogram(
+                y=audio,
+                sr=self.config.sample_rate,
+                n_fft=512,
+                hop_length=int(0.01 * self.config.sample_rate),
+                win_length=int(0.025 * self.config.sample_rate),
+                n_mels=80,
+                fmin=0,
+                fmax=8000,
+            )
+            mel = np.log(np.maximum(mel, 1e-10))
+            mel = (mel - mel.mean()) / (mel.std() + 1e-10)
+            return mel[np.newaxis, ...]
+
+    def _decode_tokens(self, token_ids: np.ndarray) -> str:
+        """Decode token IDs to text"""
+        # Remove padding and special tokens
+        token_ids = token_ids.flatten()
+        token_ids = token_ids[token_ids > 0]  # Remove padding
+
+        if self._tokenizer is not None:
+            if hasattr(self._tokenizer, 'decode'):
+                return self._tokenizer.decode(token_ids.tolist())
+            elif hasattr(self._tokenizer, 'DecodeIds'):
+                return self._tokenizer.DecodeIds(token_ids.tolist())
+
+        # Fallback: return token IDs as string (for debugging)
+        return " ".join(map(str, token_ids.tolist()))
 
     def _warmup(self):
-        """Warmup the model"""
+        """Warmup the engines"""
         dummy_audio = np.zeros(self.config.sample_rate, dtype=np.float32)
         _ = self._transcribe_sync(dummy_audio)
 
     def _transcribe_sync(self, audio: np.ndarray) -> str:
-        """Synchronous transcription"""
-        if self._model is None:
+        """Synchronous transcription using TRT engines"""
+        if self._encoder is None:
             self.load()
 
         try:
-            result = self._model.recognize(audio)
-            return result if isinstance(result, str) else result.get('text', '')
+            # Preprocess to mel spectrogram
+            mel = self._preprocess_audio(audio)
+
+            # Encoder inference
+            # Input shape: [batch, mel_bins, time]
+            encoder_out = self._encoder.infer({"audio_signal": mel})
+            encoded = encoder_out.get("encoded", list(encoder_out.values())[0])
+            encoded_len = np.array([[encoded.shape[-1]]], dtype=np.int64)
+
+            # Decoder inference (greedy decoding)
+            # TDT decoder takes encoded features and outputs token logits
+            decoder_out = self._decoder.infer({
+                "encoder_output": encoded,
+                "encoder_output_length": encoded_len
+            })
+
+            # Get predicted tokens
+            logits = decoder_out.get("logits", list(decoder_out.values())[0])
+            token_ids = np.argmax(logits, axis=-1)
+
+            # Decode to text
+            text = self._decode_tokens(token_ids)
+            return text.strip()
+
         except Exception as e:
             logger.error(f"Transcription error: {e}")
             return ""
 
     async def transcribe(self, audio: np.ndarray) -> str:
         """Async transcription"""
-        if self._model is None:
+        if self._encoder is None:
             self.load()
 
         loop = asyncio.get_event_loop()
@@ -181,22 +298,17 @@ class ParakeetASR:
             audio
         )
 
-    def transcribe_with_timestamps(self, audio: np.ndarray) -> dict:
-        """Transcribe with word-level timestamps"""
-        if self._model is None:
-            self.load()
-
-        try:
-            model_with_ts = self._model.with_timestamps()
-            result = model_with_ts.recognize(audio)
-            return result
-        except Exception as e:
-            logger.error(f"Timestamp transcription error: {e}")
-            return {"text": "", "words": []}
-
     def shutdown(self):
         """Cleanup resources"""
         self._executor.shutdown(wait=False)
+        if self._encoder:
+            self._encoder.shutdown()
+        if self._decoder:
+            self._decoder.shutdown()
+
+
+# Alias for compatibility
+ParakeetASR = ParakeetTRTASR
 
 
 class StreamingASRBuffer:
@@ -312,7 +424,7 @@ class StreamingASR:
 
     def __init__(self, config: Optional[ASRConfig] = None):
         self.config = config or ASRConfig()
-        self._asr = ParakeetASR(self.config)
+        self._asr = ParakeetTRTASR(self.config)
         self._buffer = StreamingASRBuffer(self.config)
         self._on_transcription: Optional[Callable[[str, float], Any]] = None
 
