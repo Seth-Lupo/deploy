@@ -50,7 +50,18 @@ class PipelineConfig:
     tts_exaggeration: float = 0.5
 
     # System prompt
-    system_prompt: str = """You are a fast, helpful voice assistant. Keep responses extremely brief - one sentence when possible. Never use emojis, asterisks, or special formatting. Speak naturally and directly. Get to the point immediately."""
+    system_prompt: str = """You are a fast, helpful voice assistant. Keep responses extremely brief - one sentence when possible.
+
+CRITICAL RULES:
+- NEVER use emojis, asterisks, or special formatting
+- ALWAYS write numbers as words (say "twenty three" not "23")
+- For phone numbers, spell each digit: "five five five, one two three, four five six seven"
+- Speak naturally and directly. Get to the point immediately.
+
+You can use these natural speech sounds sparingly for expressiveness:
+[clear throat] [sigh] [shush] [cough] [groan] [sniff] [gasp] [chuckle] [laugh]
+
+Example: "[chuckle] That's a great question." or "Hmm, [sigh] let me think about that." """
 
     # Pipeline settings
     enable_interrupts: bool = True
@@ -59,14 +70,53 @@ class PipelineConfig:
 
 @dataclass
 class PipelineMetrics:
-    """Metrics for pipeline performance"""
-    asr_latency: float = 0.0
-    llm_first_token: float = 0.0
-    llm_first_sentence: float = 0.0
-    tts_first_chunk: float = 0.0
-    total_latency: float = 0.0
+    """Metrics for pipeline performance - all times in milliseconds"""
+    # Reference timestamp (internal)
+    response_start_time: float = 0.0
+
+    # Latencies in ms (relative to response_start_time)
+    llm_first_token_ms: float = 0.0
+    llm_last_token_ms: float = 0.0
+    llm_first_sentence_ms: float = 0.0
+    tts_first_chunk_ms: float = 0.0
+    first_audio_sent_ms: float = 0.0
+    total_response_ms: float = 0.0
+
+    # Counts
+    llm_tokens: int = 0
     sentences_generated: int = 0
     audio_chunks_sent: int = 0
+
+    # Audio stats
+    total_audio_duration_ms: float = 0.0
+
+    # Performance
+    llm_tokens_per_sec: float = 0.0
+    tts_rtf: float = 0.0
+
+    def log_metrics(self):
+        """Log formatted metrics"""
+        lines = [
+            "",
+            "--- Response Metrics ---",
+            f"LLM first token     {self.llm_first_token_ms:7.0f} ms",
+            f"LLM last token      {self.llm_last_token_ms:7.0f} ms",
+            f"LLM first sentence  {self.llm_first_sentence_ms:7.0f} ms",
+            f"TTS first chunk     {self.tts_first_chunk_ms:7.0f} ms",
+            f"First audio sent    {self.first_audio_sent_ms:7.0f} ms",
+            f"Total response      {self.total_response_ms:7.0f} ms",
+            "------------------------",
+            f"LLM tokens          {self.llm_tokens:7d}",
+            f"LLM tokens/sec      {self.llm_tokens_per_sec:7.1f}",
+            f"Sentences           {self.sentences_generated:7d}",
+            f"Audio chunks        {self.audio_chunks_sent:7d}",
+            f"Audio duration      {self.total_audio_duration_ms:7.0f} ms",
+            f"TTS RTF             {self.tts_rtf:7.2f}",
+            "------------------------",
+            "",
+        ]
+        for line in lines:
+            logger.info(line)
 
 
 class VoicePipeline:
@@ -94,6 +144,7 @@ class VoicePipeline:
         self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=self.config.audio_queue_size)
         self._interrupt_event = asyncio.Event()
         self._shutdown_event = asyncio.Event()
+        self._tts_done_event = asyncio.Event()  # Signals TTS finished processing
 
         # Worker tasks
         self._tts_worker_task: Optional[asyncio.Task] = None
@@ -104,6 +155,11 @@ class VoicePipeline:
         self._on_audio_chunk: Optional[Callable[[np.ndarray, dict], Any]] = None
         self._on_state_change: Optional[Callable[[PipelineState], Any]] = None
         self._on_metrics: Optional[Callable[[PipelineMetrics], Any]] = None
+
+    @property
+    def metrics(self) -> PipelineMetrics:
+        """Get current metrics"""
+        return self._metrics
 
     def set_callbacks(
         self,
@@ -127,6 +183,12 @@ class VoicePipeline:
             logger.debug(f"Pipeline state: {state.name}")
             if self._on_state_change:
                 self._on_state_change(state)
+
+    def _ms_since_start(self) -> float:
+        """Get milliseconds since response started"""
+        if self._metrics.response_start_time > 0:
+            return (time.time() - self._metrics.response_start_time) * 1000
+        return 0.0
 
     async def initialize(self):
         """Initialize all pipeline components"""
@@ -155,6 +217,12 @@ class VoicePipeline:
             system_prompt=self.config.system_prompt,
         )
         self._llm = StreamingLLM(llm_config)
+
+        # Set LLM token callback to count tokens
+        self._llm.set_callbacks(
+            on_token=self._handle_llm_token,
+        )
+
         await loop.run_in_executor(None, self._llm.load)
         logger.info("LLM initialized")
 
@@ -173,6 +241,15 @@ class VoicePipeline:
 
         self._set_state(PipelineState.IDLE)
         logger.info("Voice pipeline ready")
+
+    def _handle_llm_token(self, token: str):
+        """Handle LLM token for metrics"""
+        now = self._ms_since_start()
+        if self._metrics.llm_tokens == 0:
+            # First token
+            self._metrics.llm_first_token_ms = now
+        self._metrics.llm_last_token_ms = now
+        self._metrics.llm_tokens += 1
 
     async def _tts_worker(self):
         """
@@ -193,32 +270,33 @@ class VoicePipeline:
                 if sentence is None:
                     # End of response signal
                     await self._audio_queue.put(None)
+                    self._tts_done_event.set()  # Signal TTS is done
                     continue
 
                 if self._interrupt_event.is_set():
                     continue
 
                 # Generate audio for this sentence
-                tts_start = time.time()
-                first_chunk = True
-                logger.info(f"TTS worker: generating audio for '{sentence[:30]}...'")
+                first_chunk_this_sentence = (self._metrics.tts_first_chunk_ms == 0.0)
 
                 async for audio_chunk in self._tts.speak(sentence):
                     if self._interrupt_event.is_set():
                         break
 
-                    if first_chunk:
-                        self._metrics.tts_first_chunk = time.time() - tts_start
-                        first_chunk = False
+                    # Track first TTS chunk time (relative to response start)
+                    if first_chunk_this_sentence:
+                        self._metrics.tts_first_chunk_ms = self._ms_since_start()
+                        first_chunk_this_sentence = False
+
+                    # Calculate audio duration
+                    chunk_duration_ms = (len(audio_chunk) / self._tts.sample_rate) * 1000
+                    self._metrics.total_audio_duration_ms += chunk_duration_ms
 
                     # Put audio in output queue
-                    logger.info(f"TTS worker: got audio chunk shape={audio_chunk.shape}, putting in queue")
                     try:
                         self._audio_queue.put_nowait(audio_chunk)
                         self._metrics.audio_chunks_sent += 1
-                        logger.info(f"TTS worker: audio chunk queued, queue size={self._audio_queue.qsize()}")
                     except asyncio.QueueFull:
-                        # Drop if queue full
                         logger.warning("Audio queue full, dropping chunk")
 
             except asyncio.CancelledError:
@@ -246,7 +324,6 @@ class VoicePipeline:
         transcription = await self._asr.process_audio(audio)
 
         if transcription:
-            self._metrics.asr_latency = time.time()  # Will be used for total latency calc
             if self._on_transcription:
                 self._on_transcription(transcription, 0.0)
             return transcription
@@ -260,9 +337,12 @@ class VoicePipeline:
         """
         self._set_state(PipelineState.PROCESSING)
         self._interrupt_event.clear()
-        self._metrics = PipelineMetrics()
+        self._tts_done_event.clear()
 
-        response_start = time.time()
+        # Reset metrics for this response
+        self._metrics = PipelineMetrics()
+        self._metrics.response_start_time = time.time()
+
         first_sentence = True
 
         try:
@@ -270,18 +350,18 @@ class VoicePipeline:
                 if self._interrupt_event.is_set():
                     break
 
-                # Track metrics
+                # Track first sentence time
                 if first_sentence:
-                    self._metrics.llm_first_sentence = time.time() - response_start
+                    self._metrics.llm_first_sentence_ms = self._ms_since_start()
                     first_sentence = False
 
                 self._metrics.sentences_generated += 1
 
                 # Notify callback
                 if self._on_llm_sentence:
-                    self._on_llm_sentence(sentence, time.time() - response_start)
+                    self._on_llm_sentence(sentence, self._ms_since_start())
 
-                # Queue for TTS (TTS will stream audio chunks)
+                # Queue for TTS
                 await self._sentence_queue.put(sentence)
 
                 self._set_state(PipelineState.SPEAKING)
@@ -289,8 +369,29 @@ class VoicePipeline:
             # Signal end of response
             await self._sentence_queue.put(None)
 
-            # Calculate total latency
-            self._metrics.total_latency = time.time() - response_start
+            # Wait for TTS to finish processing (with timeout)
+            try:
+                await asyncio.wait_for(self._tts_done_event.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.warning("TTS processing timed out")
+
+            # Calculate final metrics
+            self._metrics.total_response_ms = self._ms_since_start()
+
+            # Calculate LLM tokens per second (using actual LLM generation time only)
+            if self._metrics.llm_tokens > 0 and self._metrics.llm_first_token_ms > 0 and self._metrics.llm_last_token_ms > 0:
+                llm_gen_time_sec = (self._metrics.llm_last_token_ms - self._metrics.llm_first_token_ms) / 1000
+                if llm_gen_time_sec > 0:
+                    self._metrics.llm_tokens_per_sec = self._metrics.llm_tokens / llm_gen_time_sec
+
+            # Calculate TTS RTF (real-time factor)
+            if self._metrics.total_audio_duration_ms > 0:
+                tts_time_ms = self._metrics.total_response_ms - self._metrics.llm_first_sentence_ms
+                if tts_time_ms > 0:
+                    self._metrics.tts_rtf = tts_time_ms / self._metrics.total_audio_duration_ms
+
+            # Log metrics
+            self._metrics.log_metrics()
 
             if self._on_metrics:
                 self._on_metrics(self._metrics)
@@ -298,6 +399,11 @@ class VoicePipeline:
         except asyncio.CancelledError:
             await self.interrupt()
             raise
+
+    def mark_first_audio_sent(self):
+        """Called by server when first audio chunk is actually sent to client"""
+        if self._metrics.first_audio_sent_ms == 0.0:
+            self._metrics.first_audio_sent_ms = self._ms_since_start()
 
     async def get_audio_chunk(self) -> Optional[np.ndarray]:
         """

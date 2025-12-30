@@ -29,7 +29,7 @@ class TTSConfig:
     top_p: float = 0.95
     repetition_penalty: float = 1.2
     # Streaming settings
-    chunk_size: int = 40  # Speech tokens per chunk (larger = fewer seams)
+    chunk_size: int = 25  # Speech tokens per chunk (balance latency vs quality)
     context_window: int = 15  # Context for continuity (smaller = less overlap)
 
 
@@ -62,15 +62,21 @@ class StreamingChatterboxTurboTTS:
         logger.info("Chatterbox TURBO TTS ready")
 
     def _warmup(self):
-        """Warmup the model"""
+        """Warmup the model with multiple generations to compile all code paths"""
+        warmup_texts = [
+            "Hello there.",
+            "This is a warmup test for the text to speech system.",
+            "One more sentence to fully compile.",
+        ]
         try:
-            # Use streaming warmup
-            for chunk, metrics in self._model.generate_stream(
-                "Hello.",
-                chunk_size=self.config.chunk_size,
-                print_metrics=False
-            ):
-                pass  # Just run through to warmup
+            for i, text in enumerate(warmup_texts):
+                for chunk, metrics in self._model.generate_stream(
+                    text,
+                    chunk_size=self.config.chunk_size,
+                    print_metrics=False
+                ):
+                    pass  # Just run through to warmup
+                logger.info(f"TTS warmup {i+1}/{len(warmup_texts)} complete")
         except Exception as e:
             logger.warning(f"Warmup failed: {e}")
 

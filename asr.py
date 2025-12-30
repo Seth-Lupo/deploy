@@ -128,18 +128,24 @@ class ParakeetASR:
         logger.info(f"Loading Parakeet ASR: {self.config.model}")
         logger.info(f"Quantization: {self.config.quantization}")
 
+        # Force CUDA execution provider
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        logger.info(f"Using ONNX providers: {providers}")
+
         # Load with specified quantization
         # For FP16/FP32, we use the non-int8 model
         if self.config.quantization == "int8":
             self._model = onnx_asr.load_model(
                 self.config.model,
-                quantization="int8"
+                quantization="int8",
+                providers=providers
             )
         else:
             # FP16/FP32 - load without quantization
             self._model = onnx_asr.load_model(
                 self.config.model,
-                quantization=None  # Uses default FP16/FP32
+                quantization=None,  # Uses default FP16/FP32
+                providers=providers
             )
 
         # Warmup

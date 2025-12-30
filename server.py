@@ -87,6 +87,7 @@ class VoiceSession:
         self._running = False
         self._audio_sender_task: Optional[asyncio.Task] = None
         self._response_task: Optional[asyncio.Task] = None
+        self._first_audio_sent = False
 
     async def start(self):
         """Initialize and start the session"""
@@ -171,7 +172,7 @@ class VoiceSession:
         """Handle LLM sentence callback"""
         asyncio.create_task(self._send_message("llm_sentence", {
             "text": sentence,
-            "latency_ms": latency * 1000
+            "latency_ms": latency
         }))
 
     def _handle_state_change(self, state: PipelineState):
@@ -182,7 +183,20 @@ class VoiceSession:
 
     def _handle_metrics(self, metrics: PipelineMetrics):
         """Handle metrics callback"""
-        asyncio.create_task(self._send_message("metrics", asdict(metrics)))
+        metrics_dict = {
+            "llm_first_token_ms": metrics.llm_first_token_ms,
+            "llm_first_sentence_ms": metrics.llm_first_sentence_ms,
+            "tts_first_chunk_ms": metrics.tts_first_chunk_ms,
+            "first_audio_sent_ms": metrics.first_audio_sent_ms,
+            "total_response_ms": metrics.total_response_ms,
+            "llm_tokens": metrics.llm_tokens,
+            "sentences_generated": metrics.sentences_generated,
+            "audio_chunks_sent": metrics.audio_chunks_sent,
+            "total_audio_duration_ms": metrics.total_audio_duration_ms,
+            "llm_tokens_per_sec": metrics.llm_tokens_per_sec,
+            "tts_rtf": metrics.tts_rtf,
+        }
+        asyncio.create_task(self._send_message("metrics", metrics_dict))
 
     async def _audio_sender(self):
         """Background task to send audio chunks"""
@@ -191,13 +205,17 @@ class VoiceSession:
                 chunk = await self._pipeline.get_audio_chunk()
 
                 if chunk is None:
-                    # End of response
-                    logger.info("Audio sender: got None, sending audio_end")
+                    # End of response - reset first audio flag for next response
+                    self._first_audio_sent = False
                     await self._send_message("audio_end", {})
                     continue
 
                 if len(chunk) > 0:
-                    logger.info(f"Audio sender: sending chunk len={len(chunk)}")
+                    # Mark first audio sent time in pipeline metrics
+                    if not self._first_audio_sent:
+                        self._pipeline.mark_first_audio_sent()
+                        self._first_audio_sent = True
+
                     await self._send_audio(chunk)
 
             except asyncio.CancelledError:
@@ -241,6 +259,9 @@ class VoiceSession:
         transcription = await self._pipeline.process_audio(audio_float)
 
         if transcription:
+            # Reset first audio flag for new response
+            self._first_audio_sent = False
+
             # Start response generation
             if self._response_task and not self._response_task.done():
                 await self._pipeline.interrupt()
@@ -260,6 +281,9 @@ class VoiceSession:
             "text": text,
             "latency_ms": 0
         })
+
+        # Reset first audio flag for new response
+        self._first_audio_sent = False
 
         # Start response
         if self._response_task and not self._response_task.done():

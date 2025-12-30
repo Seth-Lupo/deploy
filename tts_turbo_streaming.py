@@ -249,7 +249,7 @@ class ChatterboxTurboStreamingTTS(ChatterboxTurboTTS):
 
         # Watermark and return
         audio_duration = len(audio_chunk) / self.sr
-        watermarked_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
+        watermarked_chunk = audio_chunk  # Watermarking disabled for speed
         audio_tensor = torch.from_numpy(watermarked_chunk).unsqueeze(0)
 
         # Update metrics
