@@ -261,6 +261,12 @@ class ChatterboxHybridTTS:
     def _load_s3gen(self):
         """Load S3Gen vocoder"""
         import torch
+        import sys
+
+        # Add deploy directory to path for s3gen import
+        deploy_dir = os.path.dirname(os.path.abspath(__file__))
+        if deploy_dir not in sys.path:
+            sys.path.insert(0, deploy_dir)
 
         # Try standalone S3Gen first
         try:
