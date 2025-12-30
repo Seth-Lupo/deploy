@@ -108,6 +108,9 @@ class TRTEngine:
                 shape = input_shapes.get(name, binding.shape)
             else:
                 shape = self.context.get_tensor_shape(name)
+                # Convert TRT Dims to tuple if needed
+                if hasattr(shape, '__iter__') and not isinstance(shape, tuple):
+                    shape = tuple(shape)
 
             size = int(np.prod(shape) * np.dtype(binding.dtype).itemsize)
 
@@ -159,6 +162,9 @@ class TRTEngine:
         outputs = {}
         for name in self.output_names:
             shape = self.context.get_tensor_shape(name)
+            # Convert TRT Dims to tuple if needed
+            if hasattr(shape, '__iter__') and not isinstance(shape, tuple):
+                shape = tuple(shape)
             host_buffer = np.zeros(shape, dtype=self.bindings[name].dtype)
             cuda.memcpy_dtoh_async(host_buffer, self._device_buffers[name], self.stream)
             outputs[name] = host_buffer

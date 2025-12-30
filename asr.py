@@ -135,9 +135,31 @@ class ParakeetTRTASR:
         self._encoder = TRTEngine(encoder_path)
         self._encoder.load()
 
+        # Log expected input shapes for debugging
+        for name in self._encoder.input_names:
+            binding = self._encoder.bindings[name]
+            logger.info(f"  Encoder input '{name}': shape={binding.shape}, dtype={binding.dtype}")
+
         logger.info(f"Loading Parakeet TRT decoder: {decoder_path}")
         self._decoder = TRTEngine(decoder_path)
         self._decoder.load()
+
+        # Log decoder input shapes
+        for name in self._decoder.input_names:
+            binding = self._decoder.bindings[name]
+            logger.info(f"  Decoder input '{name}': shape={binding.shape}, dtype={binding.dtype}")
+
+        # Detect expected mel bins from encoder input shape
+        audio_binding = self._encoder.bindings.get("audio_signal")
+        if audio_binding:
+            expected_shape = audio_binding.shape
+            if len(expected_shape) >= 2:
+                self._expected_mel_bins = expected_shape[1] if expected_shape[1] > 0 else 80
+            else:
+                self._expected_mel_bins = 80
+        else:
+            self._expected_mel_bins = 80
+        logger.info(f"Expected mel bins: {self._expected_mel_bins}")
 
         # Load preprocessor for mel spectrogram extraction
         self._load_preprocessor()
@@ -151,28 +173,44 @@ class ParakeetTRTASR:
 
     def _load_preprocessor(self):
         """Load audio preprocessor for mel spectrogram extraction"""
+        # Use detected mel bins or default to 80
+        n_mels = getattr(self, '_expected_mel_bins', 80)
+
+        # Check for static time dimension issue
+        audio_binding = self._encoder.bindings.get("audio_signal")
+        if audio_binding and len(audio_binding.shape) >= 3:
+            time_dim = audio_binding.shape[2]
+            if time_dim > 0 and time_dim == 1:
+                logger.warning(
+                    f"ASR encoder has static time dimension of 1. "
+                    f"This suggests the engine was built incorrectly or for streaming mode. "
+                    f"Please rebuild with dynamic shapes: [1, {n_mels}, -1]"
+                )
+
         try:
             import torch
             import torchaudio
 
-            # Parakeet uses 80 mel bins, 10ms hop, 25ms window
+            # Use detected mel bins
             self._mel_transform = torchaudio.transforms.MelSpectrogram(
                 sample_rate=self.config.sample_rate,
                 n_fft=512,
                 win_length=int(0.025 * self.config.sample_rate),  # 25ms
                 hop_length=int(0.01 * self.config.sample_rate),   # 10ms
-                n_mels=80,
+                n_mels=n_mels,
                 f_min=0,
                 f_max=8000,
             )
             self._preprocessor = "torchaudio"
-            logger.info("Using torchaudio preprocessor")
+            self._n_mels = n_mels
+            logger.info(f"Using torchaudio preprocessor with {n_mels} mel bins")
         except ImportError:
             # Fallback to librosa
             try:
                 import librosa
                 self._preprocessor = "librosa"
-                logger.info("Using librosa preprocessor")
+                self._n_mels = n_mels
+                logger.info(f"Using librosa preprocessor with {n_mels} mel bins")
             except ImportError:
                 raise RuntimeError("Neither torchaudio nor librosa available for preprocessing")
 
@@ -206,6 +244,8 @@ class ParakeetTRTASR:
 
     def _preprocess_audio(self, audio: np.ndarray) -> np.ndarray:
         """Convert audio to mel spectrogram features"""
+        n_mels = getattr(self, '_n_mels', 80)
+
         if self._preprocessor == "torchaudio":
             import torch
             audio_tensor = torch.from_numpy(audio).float().unsqueeze(0)
@@ -224,7 +264,7 @@ class ParakeetTRTASR:
                 n_fft=512,
                 hop_length=int(0.01 * self.config.sample_rate),
                 win_length=int(0.025 * self.config.sample_rate),
-                n_mels=80,
+                n_mels=n_mels,
                 fmin=0,
                 fmax=8000,
             )
@@ -249,8 +289,13 @@ class ParakeetTRTASR:
 
     def _warmup(self):
         """Warmup the engines"""
-        dummy_audio = np.zeros(self.config.sample_rate, dtype=np.float32)
-        _ = self._transcribe_sync(dummy_audio)
+        try:
+            dummy_audio = np.zeros(self.config.sample_rate, dtype=np.float32)
+            _ = self._transcribe_sync(dummy_audio)
+            logger.info("ASR warmup complete")
+        except Exception as e:
+            logger.warning(f"ASR warmup failed: {e}")
+            logger.warning("ASR may work on first actual inference or needs engine rebuild")
 
     def _transcribe_sync(self, audio: np.ndarray) -> str:
         """Synchronous transcription using TRT engines"""

@@ -116,15 +116,59 @@ class ChatterboxTRTTTS:
         logger.info("Chatterbox TRT TTS ready")
 
     def _load_s3gen(self, pytorch_path: str):
-        """Load S3Gen vocoder from safetensors"""
+        """Load S3Gen vocoder from safetensors or .pt file"""
         import torch
-        from safetensors.torch import load_file
+
+        # Find S3Gen weights file
+        s3gen_weights = None
+        weight_files = [
+            "s3gen.safetensors",
+            "s3gen.pt",
+            "s3gen.pth",
+            "vocoder.pt",
+            "vocoder.pth",
+        ]
+
+        weight_path = None
+        for wf in weight_files:
+            candidate = os.path.join(pytorch_path, wf)
+            if os.path.exists(candidate):
+                weight_path = candidate
+                break
+
+        if weight_path is None:
+            logger.error(f"No S3Gen weights found in {pytorch_path}")
+            self._s3gen = None
+            return
+
+        # Load weights based on format
+        logger.info(f"Loading S3Gen weights from: {weight_path}")
+        try:
+            if weight_path.endswith('.safetensors'):
+                from safetensors.torch import load_file
+                s3gen_weights = load_file(weight_path)
+            else:
+                # PyTorch format (.pt, .pth)
+                checkpoint = torch.load(weight_path, map_location=self.config.device, weights_only=False)
+                # Handle different checkpoint structures
+                if isinstance(checkpoint, dict):
+                    if 'state_dict' in checkpoint:
+                        s3gen_weights = checkpoint['state_dict']
+                    elif 'model' in checkpoint:
+                        s3gen_weights = checkpoint['model']
+                    else:
+                        s3gen_weights = checkpoint
+                else:
+                    s3gen_weights = checkpoint
+        except Exception as e:
+            logger.error(f"Failed to load weights from {weight_path}: {e}")
+            self._s3gen = None
+            return
 
         # Use standalone S3Gen implementation
         try:
             from s3gen import S3Token2Wav
 
-            s3gen_weights = load_file(os.path.join(pytorch_path, "s3gen.safetensors"))
             self._s3gen = S3Token2Wav()
             self._s3gen.load_state_dict(s3gen_weights, strict=False)
             self._s3gen.to(self.config.device).eval()
@@ -137,7 +181,6 @@ class ChatterboxTRTTTS:
         try:
             from chatterbox.models.s3gen import S3Gen
 
-            s3gen_weights = load_file(os.path.join(pytorch_path, "s3gen.safetensors"))
             self._s3gen = S3Gen()
             self._s3gen.load_state_dict(s3gen_weights, strict=False)
             self._s3gen.to(self.config.device).eval()
@@ -188,17 +231,36 @@ class ChatterboxTRTTTS:
             self._conds = None
 
     def _warmup(self):
-        """Warmup TRT engines"""
-        # Warmup each engine
+        """Warmup TRT engines with proper input shapes"""
+        import numpy as np
+
+        # Warmup embedding engines with reasonable token sequences
         for name, engine in [
             ("speech_emb", self._speech_emb_engine),
             ("text_emb", self._text_emb_engine),
-            ("speech_head", self._speech_head_engine),
-            ("transformer", self._transformer_engine),
         ]:
             if engine:
-                engine.warmup()
-                logger.info(f"  {name} warmed up")
+                try:
+                    # Use sequence length of 10 tokens for warmup
+                    dummy_tokens = np.zeros((1, 10), dtype=np.int64)
+                    engine.infer({"tokens": dummy_tokens})
+                    logger.info(f"  {name} warmed up")
+                except Exception as e:
+                    logger.warning(f"  {name} warmup failed: {e}")
+
+        # Warmup speech head
+        if self._speech_head_engine:
+            try:
+                # Hidden state dimension (typically 1024 for transformer)
+                dummy_hidden = np.zeros((1, 1, 1024), dtype=np.float32)
+                self._speech_head_engine.infer({"hidden": dummy_hidden})
+                logger.info("  speech_head warmed up")
+            except Exception as e:
+                logger.warning(f"  speech_head warmup failed: {e}")
+
+        # Skip transformer warmup - it has complex dynamic shapes
+        # It will warm up on first actual inference
+        logger.info("  transformer warmup skipped (will warm on first use)")
 
     def _generate_speech_tokens(
         self,
