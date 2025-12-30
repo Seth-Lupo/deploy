@@ -175,9 +175,12 @@ class QwenTRTLLM:
             )
             input_ids = self._tokenizer(text, return_tensors="pt").input_ids
 
+            # Convert to list properly
+            input_ids_list = input_ids[0].tolist() if hasattr(input_ids[0], 'tolist') else list(input_ids[0])
+
             # Run warmup generation
             outputs = self._runner.generate(
-                batch_input_ids=[input_ids[0].tolist()],
+                batch_input_ids=[input_ids_list],
                 max_new_tokens=10,
                 end_id=self._tokenizer.eos_token_id,
                 pad_id=self._tokenizer.pad_token_id or self._tokenizer.eos_token_id,

@@ -305,30 +305,79 @@ class ParakeetTRTASR:
         try:
             # Preprocess to mel spectrogram
             mel = self._preprocess_audio(audio)
+            # mel shape: [1, n_mels, time_frames]
+            time_frames = mel.shape[-1]
 
             # Encoder inference
-            # Input shape: [batch, mel_bins, time]
-            encoder_out = self._encoder.infer({"audio_signal": mel})
-            encoded = encoder_out.get("encoded", list(encoder_out.values())[0])
-            encoded_len = np.array([[encoded.shape[-1]]], dtype=np.int64)
-
-            # Decoder inference (greedy decoding)
-            # TDT decoder takes encoded features and outputs token logits
-            decoder_out = self._decoder.infer({
-                "encoder_output": encoded,
-                "encoder_output_length": encoded_len
+            # Inputs: audio_signal [1, 128, T], length [1]
+            length = np.array([time_frames], dtype=np.int64)
+            encoder_out = self._encoder.infer({
+                "audio_signal": mel,
+                "length": length
             })
 
-            # Get predicted tokens
-            logits = decoder_out.get("logits", list(decoder_out.values())[0])
-            token_ids = np.argmax(logits, axis=-1)
+            # Get encoder outputs
+            encoded = encoder_out.get("outputs", list(encoder_out.values())[0])
+            encoded_lengths = encoder_out.get("encoded_lengths", np.array([encoded.shape[-1]]))
 
-            # Decode to text
-            text = self._decode_tokens(token_ids)
-            return text.strip()
+            # Decoder inference (TDT greedy decoding)
+            # Initialize decoder state
+            batch_size = 1
+            max_decode_steps = 500
+            blank_token = 0  # Usually blank is token 0
+
+            # Initial targets and states
+            targets = np.zeros((batch_size, 1), dtype=np.int32)
+            target_length = np.array([1], dtype=np.int32)
+            input_states_1 = np.zeros((2, batch_size, 640), dtype=np.float32)
+            input_states_2 = np.zeros((2, batch_size, 640), dtype=np.float32)
+
+            decoded_tokens = []
+            enc_time = encoded.shape[-1] if len(encoded.shape) > 2 else 1
+
+            # Greedy decode loop
+            for step in range(max_decode_steps):
+                decoder_out = self._decoder.infer({
+                    "encoder_outputs": encoded,
+                    "targets": targets,
+                    "target_length": target_length,
+                    "input_states_1": input_states_1,
+                    "input_states_2": input_states_2,
+                })
+
+                # Get outputs
+                outputs = decoder_out.get("outputs", list(decoder_out.values())[0])
+                output_states_1 = decoder_out.get("output_states_1", input_states_1)
+                output_states_2 = decoder_out.get("output_states_2", input_states_2)
+
+                # Get predicted token (argmax over vocabulary)
+                if len(outputs.shape) >= 2:
+                    token_logits = outputs[0, -1] if len(outputs.shape) == 3 else outputs[0]
+                    predicted_token = int(np.argmax(token_logits))
+                else:
+                    predicted_token = int(np.argmax(outputs))
+
+                # Check for end of sequence or blank
+                if predicted_token == blank_token or len(decoded_tokens) > 100:
+                    break
+
+                decoded_tokens.append(predicted_token)
+
+                # Update states for next step
+                targets = np.array([[predicted_token]], dtype=np.int32)
+                input_states_1 = output_states_1
+                input_states_2 = output_states_2
+
+            # Decode tokens to text
+            if decoded_tokens:
+                text = self._decode_tokens(np.array(decoded_tokens))
+                return text.strip()
+            return ""
 
         except Exception as e:
             logger.error(f"Transcription error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return ""
 
     async def transcribe(self, audio: np.ndarray) -> str:
